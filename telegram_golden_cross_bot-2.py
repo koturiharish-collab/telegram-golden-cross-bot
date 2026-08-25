@@ -1,7 +1,7 @@
 import io
 import os
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -16,21 +16,30 @@ import yfinance as yf
 BOT_TOKEN = os.environ["TG_BOT_TOKEN"]
 CHAT_ID = os.environ["TG_DESTINATION"]
 
-TELEGRAM_URL = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+TELEGRAM_URL = (
+    f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+)
 
 IST = ZoneInfo("Asia/Kolkata")
 
-MARKET_START = (9, 15)
-MARKET_END = (15, 30)
+MARKET_START_HOUR = 9
+MARKET_START_MINUTE = 45
 
-SCAN_INTERVAL_SECONDS = 300       # 5 minutes
-BATCH_SIZE = 100                  # 100 stocks per Yahoo request
+MARKET_END_HOUR = 15
+MARKET_END_MINUTE = 30
+
+CHECK_INTERVAL_SECONDS = 30 * 60
+
+BATCH_SIZE = 100
 
 MIN_CROSS_GAP_PERCENT = 0.01
 
-# Prevent the same stock/direction from alerting repeatedly
-# during the same trading day.
-sent_today = set()
+
+# Keeps the EMA relationship from the previous scan.
+previous_state = {}
+
+# Prevents duplicate alerts.
+sent_alerts = set()
 
 
 # ============================================================
@@ -38,6 +47,7 @@ sent_today = set()
 # ============================================================
 
 def send_telegram(message):
+
     response = requests.post(
         TELEGRAM_URL,
         data={
@@ -51,7 +61,7 @@ def send_telegram(message):
 
 
 # ============================================================
-# NSE STOCK LIST
+# NSE SYMBOLS
 # ============================================================
 
 def get_nse_symbols():
@@ -83,6 +93,7 @@ def get_nse_symbols():
     ]
 
     if "SERIES" in df.columns:
+
         df = df[
             df["SERIES"]
             .astype(str)
@@ -106,22 +117,32 @@ def get_nse_symbols():
 # MARKET TIME
 # ============================================================
 
-def market_is_open():
+def market_time_ok():
 
     now = datetime.now(IST)
 
     if now.weekday() >= 5:
         return False
 
-    current = (
-        now.hour,
-        now.minute,
+    current_minutes = (
+        now.hour * 60
+        + now.minute
+    )
+
+    start_minutes = (
+        MARKET_START_HOUR * 60
+        + MARKET_START_MINUTE
+    )
+
+    end_minutes = (
+        MARKET_END_HOUR * 60
+        + MARKET_END_MINUTE
     )
 
     return (
-        MARKET_START
-        <= current
-        <= MARKET_END
+        start_minutes
+        <= current_minutes
+        <= end_minutes
     )
 
 
@@ -165,16 +186,58 @@ def download_batch(symbols):
 
 
 # ============================================================
-# GET ONE STOCK FROM BATCH
+# DAILY DATA — BATCH
 # ============================================================
 
-def get_stock_data(data, symbol):
+def download_daily_batch(symbols):
+
+    tickers = [
+        symbol + ".NS"
+        for symbol in symbols
+    ]
+
+    try:
+
+        data = yf.download(
+            tickers=tickers,
+            period="4mo",
+            interval="1d",
+            auto_adjust=False,
+            group_by="ticker",
+            threads=True,
+            progress=False,
+            timeout=30,
+        )
+
+        if data is None or data.empty:
+            return None
+
+        return data
+
+    except Exception as e:
+
+        print(
+            "Daily batch error:",
+            e
+        )
+
+        return None
+
+
+# ============================================================
+# EXTRACT CLOSE
+# ============================================================
+
+def extract_close(data, symbol):
 
     ticker = symbol + ".NS"
 
     try:
 
-        if isinstance(data.columns, pd.MultiIndex):
+        if isinstance(
+            data.columns,
+            pd.MultiIndex
+        ):
 
             if ticker not in data.columns.get_level_values(0):
                 return None
@@ -201,119 +264,124 @@ def get_stock_data(data, symbol):
 
         return close
 
-    except Exception as e:
-
-        print(
-            f"{symbol}: data error: {e}"
-        )
+    except Exception:
 
         return None
 
 
 # ============================================================
-# CHECK FRESH 9 / 21 EMA CROSS
+# CALCULATE CURRENT DAILY EMA
 # ============================================================
 
-def check_cross(symbol, close):
+def calculate_emas(
+    daily_close,
+    current_price
+):
+
+    if daily_close is None:
+        return None
+
+    if len(daily_close) < 30:
+        return None
+
+    # Last completed daily candle.
+    completed = daily_close.iloc[:-1]
+
+    if len(completed) < 30:
+        return None
+
+    ema9 = completed.ewm(
+        span=9,
+        adjust=False
+    ).mean()
+
+    ema21 = completed.ewm(
+        span=21,
+        adjust=False
+    ).mean()
+
+    previous_ema9 = float(
+        ema9.iloc[-1]
+    )
+
+    previous_ema21 = float(
+        ema21.iloc[-1]
+    )
+
+    # Today's evolving daily EMA.
+    k9 = 2 / (9 + 1)
+    k21 = 2 / (21 + 1)
+
+    current_ema9 = (
+        current_price * k9
+        +
+        previous_ema9 * (1 - k9)
+    )
+
+    current_ema21 = (
+        current_price * k21
+        +
+        previous_ema21 * (1 - k21)
+    )
+
+    return (
+        previous_ema9,
+        previous_ema21,
+        current_ema9,
+        current_ema21,
+    )
+
+
+# ============================================================
+# PROCESS ONE STOCK
+# ============================================================
+
+def process_stock(
+    symbol,
+    intraday_data,
+    daily_data
+):
+
+    global previous_state
 
     try:
 
-        if len(close) < 30:
+        intraday_close = extract_close(
+            intraday_data,
+            symbol
+        )
+
+        daily_close = extract_close(
+            daily_data,
+            symbol
+        )
+
+        if intraday_close is None:
             return None
 
-        # ----------------------------------------------------
-        # Latest intraday price
-        # ----------------------------------------------------
+        if daily_close is None:
+            return None
 
         current_price = float(
-            close.iloc[-1]
+            intraday_close.iloc[-1]
         )
 
-        # ----------------------------------------------------
-        # Build today's evolving daily EMA
-        #
-        # We use completed 5-minute prices to represent the
-        # current market price and calculate the evolving
-        # daily EMA from the previous completed daily EMA.
-        # ----------------------------------------------------
-
-        daily = yf.download(
-            symbol + ".NS",
-            period="4mo",
-            interval="1d",
-            auto_adjust=False,
-            progress=False,
-            threads=False,
-            timeout=20,
+        emas = calculate_emas(
+            daily_close,
+            current_price
         )
 
-        if daily is None or daily.empty:
+        if emas is None:
             return None
 
-        if isinstance(
-            daily.columns,
-            pd.MultiIndex
-        ):
-            daily.columns = (
-                daily.columns
-                .get_level_values(0)
-            )
+        (
+            previous_ema9,
+            previous_ema21,
+            current_ema9,
+            current_ema21,
+        ) = emas
 
-        if "Close" not in daily.columns:
-            return None
-
-        daily_close = (
-            pd.to_numeric(
-                daily["Close"],
-                errors="coerce",
-            )
-            .dropna()
-        )
-
-        if len(daily_close) < 30:
-            return None
-
-        # Previous completed daily candle
-        completed = daily_close.iloc[:-1]
-
-        ema9 = completed.ewm(
-            span=9,
-            adjust=False,
-        ).mean()
-
-        ema21 = completed.ewm(
-            span=21,
-            adjust=False,
-        ).mean()
-
-        prev_ema9 = float(
-            ema9.iloc[-1]
-        )
-
-        prev_ema21 = float(
-            ema21.iloc[-1]
-        )
-
-        # ----------------------------------------------------
-        # Evolving today's EMA
-        # ----------------------------------------------------
-
-        k9 = 2 / 10
-        k21 = 2 / 22
-
-        current_ema9 = (
-            current_price * k9
-            +
-            prev_ema9 * (1 - k9)
-        )
-
-        current_ema21 = (
-            current_price * k21
-            +
-            prev_ema21 * (1 - k21)
-        )
-
-        difference_percent = (
+        gap_percent = (
             abs(
                 current_ema9
                 -
@@ -325,10 +393,30 @@ def check_cross(symbol, close):
             100
         )
 
-        if (
-            difference_percent
-            < MIN_CROSS_GAP_PERCENT
-        ):
+        if gap_percent < MIN_CROSS_GAP_PERCENT:
+
+            relationship = "NEAR"
+
+        elif current_ema9 > current_ema21:
+
+            relationship = "ABOVE"
+
+        else:
+
+            relationship = "BELOW"
+
+        old_relationship = previous_state.get(
+            symbol
+        )
+
+        # First observation of the day:
+        # establish state, but DON'T alert.
+        if old_relationship is None:
+
+            previous_state[symbol] = (
+                relationship
+            )
+
             return None
 
         # ----------------------------------------------------
@@ -336,15 +424,20 @@ def check_cross(symbol, close):
         # ----------------------------------------------------
 
         bullish = (
-            prev_ema9 <= prev_ema21
+            old_relationship == "BELOW"
             and
-            current_ema9 > current_ema21
+            relationship == "ABOVE"
         )
 
         bearish = (
-            prev_ema9 >= prev_ema21
+            old_relationship == "ABOVE"
             and
-            current_ema9 < current_ema21
+            relationship == "BELOW"
+        )
+
+        # Update state every scan.
+        previous_state[symbol] = (
+            relationship
         )
 
         if not bullish and not bearish:
@@ -358,17 +451,31 @@ def check_cross(symbol, close):
 
         now = datetime.now(IST)
 
+        date_key = now.strftime(
+            "%Y-%m-%d"
+        )
+
+        alert_key = (
+            f"{date_key}|"
+            f"{symbol}|"
+            f"{direction}"
+        )
+
+        if alert_key in sent_alerts:
+            return None
+
+        sent_alerts.add(
+            alert_key
+        )
+
         return {
             "symbol": symbol,
             "direction": direction,
             "price": current_price,
             "ema9": current_ema9,
             "ema21": current_ema21,
-            "date": now.strftime(
-                "%d-%m-%Y"
-            ),
             "time": now.strftime(
-                "%H:%M"
+                "%H:%M:%S"
             ),
         }
 
@@ -382,53 +489,38 @@ def check_cross(symbol, close):
 
 
 # ============================================================
-# ONE MARKET SCAN
+# ONE COMPLETE SCAN
 # ============================================================
 
 def scan_market(symbols):
 
-    global sent_today
-
-    today = datetime.now(IST).strftime(
-        "%Y-%m-%d"
-    )
-
-    # Clear previous trading-day memory
-    sent_today = {
-        item
-        for item in sent_today
-        if item.startswith(today)
-    }
-
-    total = len(symbols)
-
-    alerts = 0
-
     print()
     print(
-        "================================================"
+        "=============================================="
     )
 
     print(
-        "SCAN START:",
+        "SCAN:",
         datetime.now(IST).strftime(
-            "%H:%M:%S"
+            "%d-%m-%Y %H:%M:%S"
         ),
         "IST"
     )
 
     print(
         "Stocks:",
-        total
+        len(symbols)
     )
 
     print(
-        "================================================"
+        "=============================================="
     )
+
+    alerts = 0
 
     for start in range(
         0,
-        total,
+        len(symbols),
         BATCH_SIZE
     ):
 
@@ -436,109 +528,91 @@ def scan_market(symbols):
             start:start + BATCH_SIZE
         ]
 
-        print(
-            f"Batch "
-            f"{start + 1}-"
-            f"{min(start + BATCH_SIZE, total)}"
+        end = min(
+            start + BATCH_SIZE,
+            len(symbols)
         )
 
-        data = download_batch(
+        print(
+            f"Batch {start + 1}-{end}"
+        )
+
+        # One batch for intraday.
+        intraday_data = download_batch(
             batch
         )
 
-        if data is None:
+        # One batch for daily history.
+        daily_data = download_daily_batch(
+            batch
+        )
+
+        if (
+            intraday_data is None
+            or
+            daily_data is None
+        ):
+
             print(
-                "Batch failed. Continuing..."
+                "Batch data unavailable."
             )
+
             continue
 
         for symbol in batch:
 
+            result = process_stock(
+                symbol,
+                intraday_data,
+                daily_data
+            )
+
+            if result is None:
+                continue
+
+            emoji = (
+                "🟢"
+                if result["direction"]
+                == "BULLISH"
+                else "🔴"
+            )
+
+            message = (
+                f"{emoji} 9 EMA / 21 EMA "
+                f"{result['direction']} CROSS\n\n"
+                f"Stock: {result['symbol']}\n"
+                f"Time: {result['time']} IST\n"
+                f"Price: ₹{result['price']:.2f}\n"
+                f"9 EMA: ₹{result['ema9']:.2f}\n"
+                f"21 EMA: ₹{result['ema21']:.2f}\n\n"
+                f"Timeframe: 1 DAY\n"
+                f"Signal: FRESH INTRADAY CROSSOVER"
+            )
+
             try:
 
-                close = get_stock_data(
-                    data,
-                    symbol
+                send_telegram(
+                    message
                 )
 
-                if close is None:
-                    continue
+                alerts += 1
 
-                result = check_cross(
-                    symbol,
-                    close
+                print(
+                    "🚨 TELEGRAM ALERT:",
+                    result["symbol"],
+                    result["direction"]
                 )
-
-                if result is None:
-                    continue
-
-                alert_key = (
-                    f"{today}|"
-                    f"{result['symbol']}|"
-                    f"{result['direction']}"
-                )
-
-                if alert_key in sent_today:
-                    continue
-
-                emoji = (
-                    "🟢"
-                    if result["direction"]
-                    == "BULLISH"
-                    else "🔴"
-                )
-
-                message = (
-                    f"{emoji} 9 EMA / 21 EMA "
-                    f"{result['direction']} CROSS\n\n"
-                    f"Stock: {result['symbol']}\n"
-                    f"Time: {result['time']} IST\n"
-                    f"Price: ₹{result['price']:.2f}\n"
-                    f"9 EMA: ₹{result['ema9']:.2f}\n"
-                    f"21 EMA: ₹{result['ema21']:.2f}\n\n"
-                    f"Timeframe: 1 DAY\n"
-                    f"Signal: FRESH INTRADAY CROSSOVER"
-                )
-
-                try:
-
-                    send_telegram(
-                        message
-                    )
-
-                    sent_today.add(
-                        alert_key
-                    )
-
-                    alerts += 1
-
-                    print(
-                        "🚨 ALERT:",
-                        result["symbol"],
-                        result["direction"],
-                        result["time"]
-                    )
-
-                except Exception as e:
-
-                    print(
-                        "Telegram error:",
-                        e
-                    )
 
             except Exception as e:
 
                 print(
-                    f"{symbol}: {e}"
+                    "Telegram error:",
+                    e
                 )
 
     print()
     print(
-        "SCAN COMPLETE:",
-        datetime.now(IST).strftime(
-            "%H:%M:%S"
-        ),
-        "IST"
+        "SCAN COMPLETE"
     )
 
     print(
@@ -547,15 +621,22 @@ def scan_market(symbols):
     )
 
     print(
-        "================================================"
+        "Next scan: approximately 30 minutes"
+    )
+
+    print(
+        "=============================================="
     )
 
 
 # ============================================================
-# MAIN — CONTINUOUS MARKET SCANNER
+# MAIN
 # ============================================================
 
 def main():
+
+    global previous_state
+    global sent_alerts
 
     print(
         "NSE 9/21 EMA INTRADAY SCANNER"
@@ -575,13 +656,22 @@ def main():
         f"Loaded {len(symbols)} NSE EQ stocks."
     )
 
+    current_date = (
+        datetime.now(IST).date()
+    )
+
+    # --------------------------------------------------------
+    # Wait until 9:45 AM
+    # --------------------------------------------------------
+
     while True:
 
         now = datetime.now(IST)
 
-        # ----------------------------------------------------
-        # Weekend
-        # ----------------------------------------------------
+        if now.date() != current_date:
+            current_date = now.date()
+            previous_state.clear()
+            sent_alerts.clear()
 
         if now.weekday() >= 5:
 
@@ -589,22 +679,28 @@ def main():
                 "Weekend. Exiting."
             )
 
-            break
+            return
 
-        current = (
-            now.hour,
-            now.minute,
+        current_minutes = (
+            now.hour * 60
+            + now.minute
         )
 
-        # ----------------------------------------------------
-        # Before market
-        # ----------------------------------------------------
+        start_minutes = (
+            MARKET_START_HOUR * 60
+            + MARKET_START_MINUTE
+        )
 
-        if current < MARKET_START:
+        end_minutes = (
+            MARKET_END_HOUR * 60
+            + MARKET_END_MINUTE
+        )
+
+        if current_minutes < start_minutes:
 
             target = now.replace(
-                hour=9,
-                minute=15,
+                hour=MARKET_START_HOUR,
+                minute=MARKET_START_MINUTE,
                 second=0,
                 microsecond=0,
             )
@@ -614,8 +710,7 @@ def main():
             ).total_seconds()
 
             print(
-                f"Before market. "
-                f"Waiting {int(wait_seconds)} seconds."
+                "Waiting until 09:45 IST..."
             )
 
             time.sleep(
@@ -627,11 +722,35 @@ def main():
 
             continue
 
-        # ----------------------------------------------------
-        # After market
-        # ----------------------------------------------------
+        if current_minutes > end_minutes:
 
-        if current > MARKET_END:
+            print(
+                "Market closed. Exiting."
+            )
+
+            return
+
+        break
+
+    # --------------------------------------------------------
+    # Continuous 30-minute scanning
+    # --------------------------------------------------------
+
+    while True:
+
+        now = datetime.now(IST)
+
+        current_minutes = (
+            now.hour * 60
+            + now.minute
+        )
+
+        end_minutes = (
+            MARKET_END_HOUR * 60
+            + MARKET_END_MINUTE
+        )
+
+        if current_minutes > end_minutes:
 
             print(
                 "NSE market closed."
@@ -639,48 +758,21 @@ def main():
 
             break
 
-        # ----------------------------------------------------
-        # Scan
-        # ----------------------------------------------------
-
         scan_market(
             symbols
         )
 
         # ----------------------------------------------------
-        # Wait for next 5-minute scan
+        # Wait exactly approximately 30 minutes from the
+        # completion of this scan.
         # ----------------------------------------------------
 
-        now = datetime.now(IST)
-
-        seconds_into_minute = (
-            now.second
-            +
-            now.microsecond / 1_000_000
-        )
-
-        minutes_to_next = (
-            5
-            -
-            (now.minute % 5)
-        )
-
-        wait_seconds = (
-            minutes_to_next * 60
-            -
-            seconds_into_minute
-        )
-
         print(
-            f"Next scan in "
-            f"{int(wait_seconds)} seconds."
+            "Sleeping 30 minutes..."
         )
 
         time.sleep(
-            max(
-                30,
-                wait_seconds
-            )
+            CHECK_INTERVAL_SECONDS
         )
 
 
