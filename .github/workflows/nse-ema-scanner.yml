@@ -1,0 +1,29 @@
+name: NSE 9-21 EMA Daily Scanner
+
+on:
+  schedule:
+    # 4:00 PM India time = 10:30 UTC
+    - cron: "30 10 * * 1-5"
+  workflow_dispatch:
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run NSE EMA scanner
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_DESTINATION: ${{ secrets.TG_DESTINATION }}
+        run: python telegram_golden_cross_bot-2.py
