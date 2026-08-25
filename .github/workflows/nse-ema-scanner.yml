@@ -1,9 +1,9 @@
-name: NSE 9-21 EMA Daily Scanner
+name: NSE 9-21 EMA Intraday Scanner
 
 on:
   schedule:
-    # 4:00 PM India time = 10:30 UTC
-    - cron: "30 10 * * 1-5"
+    # 9:20 AM IST = 3:50 AM UTC
+    - cron: "50 3 * * 1-5"
   workflow_dispatch:
 
 jobs:
